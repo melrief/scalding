@@ -24,22 +24,29 @@ import cascading.flow.local.LocalFlowProcess
 import cascading.pipe.Pipe
 import cascading.scheme.Scheme
 import cascading.scheme.local.{TextLine => CLTextLine, TextDelimited => CLTextDelimited}
-import cascading.scheme.hadoop.{TextLine => CHTextLine, TextDelimited => CHTextDelimited, SequenceFile => CHSequenceFile}
+import cascading.scheme.hadoop.{TextLine => CHTextLine, TextDelimited => CHTextDelimited, SequenceFile => CHSequenceFile, WritableSequenceFile => CHWritableSequenceFile }
 import cascading.tap.hadoop.Hfs
 import cascading.tap.MultiSourceTap
 import cascading.tap.SinkMode
 import cascading.tap.Tap
 import cascading.tap.local.FileTap
-import cascading.tuple.{Tuple, TupleEntryIterator, Fields}
+import cascading.tuple.{Tuple, TupleEntry, TupleEntryIterator, Fields}
+
+import com.etsy.cascading.tap.local.LocalTap
 
 import org.apache.hadoop.conf.Configuration
+import org.apache.hadoop.fs.FileStatus
 import org.apache.hadoop.fs.Path
 import org.apache.hadoop.mapred.JobConf
 import org.apache.hadoop.mapred.OutputCollector
 import org.apache.hadoop.mapred.RecordReader
+import org.apache.hadoop.io.Writable
+import org.apache.commons.lang.StringEscapeUtils
 
 import collection.mutable.{Buffer, MutableList}
 import scala.collection.JavaConverters._
+
+import com.codahale.jerkson.Json
 
 /**
 * This is a base class for File-based sources
@@ -66,7 +73,7 @@ abstract class FileSource extends Source {
           case Read => SinkMode.KEEP
           case Write => SinkMode.REPLACE
         }
-        new FileTap(localScheme, localPath, sinkmode)
+        createLocalTap(sinkmode)
       }
       case hdfsMode @ Hdfs(_, _) => readOrWrite match {
         case Read => createHdfsReadTap(hdfsMode)
@@ -75,6 +82,8 @@ abstract class FileSource extends Source {
       case _ => super.createTap(readOrWrite)(mode)
     }
   }
+
+  def createLocalTap(sinkMode : SinkMode) : Tap[_,_,_] = new FileTap(localScheme, localPath, sinkMode)
 
   // This is only called when Mode.sourceStrictness is true
   protected def hdfsReadPathsAreGood(conf : Configuration) = {
@@ -115,7 +124,7 @@ abstract class FileSource extends Source {
     }
     else {
       // If there are no matching paths, this is still an error, we need at least something:
-      hdfsPaths.filter{ pathIsGood(_, hdfsMode.config) }
+      hdfsPaths.filter{ pathIsGood(_, hdfsMode.jobConf) }
     }
   }
 
@@ -146,10 +155,12 @@ class ScaldingMultiSourceTap(taps : Seq[Tap[JobConf, RecordReader[_,_], OutputCo
 * The fields here are ('offset, 'line)
 */
 trait TextLineScheme extends Mappable[String] {
+  import Dsl._
+  override val converter = implicitly[TupleConverter[String]]
   override def localScheme = new CLTextLine()
-  override def hdfsScheme = new CHTextLine().asInstanceOf[Scheme[JobConf,RecordReader[_,_],OutputCollector[_,_],_,_]]
+  override def hdfsScheme = HadoopSchemeInstance(new CHTextLine())
   //In textline, 0 is the byte position, the actual text string is in column 1
-  override val columnNums = Seq(1)
+  override def sourceFields = Dsl.intFields(Seq(1))
 }
 
 /**
@@ -167,9 +178,8 @@ trait DelimitedScheme extends Source {
   //These should not be changed:
   override def localScheme = new CLTextDelimited(fields, skipHeader, writeHeader, separator, types)
 
-  override def hdfsScheme = {
-    new CHTextDelimited(fields, skipHeader, writeHeader, separator, types).asInstanceOf[Scheme[JobConf,RecordReader[_,_],OutputCollector[_,_],_,_]]
-  }
+  override def hdfsScheme =
+    HadoopSchemeInstance(new CHTextDelimited(fields, skipHeader, writeHeader, separator, types))
 }
 
 trait SequenceFileScheme extends Source {
@@ -177,8 +187,40 @@ trait SequenceFileScheme extends Source {
   val fields = Fields.ALL
   // TODO Cascading doesn't support local mode yet
   override def hdfsScheme = {
-    new CHSequenceFile(fields).asInstanceOf[Scheme[JobConf,RecordReader[_,_],OutputCollector[_,_],_,_]]
+    HadoopSchemeInstance(new CHSequenceFile(fields))
   }
+}
+
+trait WritableSequenceFileScheme extends Source {
+  //override these as needed:
+  val fields = Fields.ALL
+  val keyType : Class[_ <: Writable]
+  val valueType : Class[_ <: Writable]
+
+  // TODO Cascading doesn't support local mode yet
+  override def hdfsScheme =
+    HadoopSchemeInstance(new CHWritableSequenceFile(fields, keyType, valueType))
+}
+
+/**
+ * Ensures that a _SUCCESS file is present in the Source path.
+ */
+trait SuccessFileSource extends FileSource {
+  override protected def pathIsGood(p: String, conf: Configuration) = {
+    val path = new Path(p)
+    Option(path.getFileSystem(conf).globStatus(path)).
+      map { statuses: Array[FileStatus] =>
+        // Must have a file that is called "_SUCCESS"
+        statuses.exists { fs: FileStatus =>
+          fs.getPath.getName == "_SUCCESS"
+        }
+      }
+      .getOrElse(false)
+  }
+}
+
+trait LocalTapSource extends FileSource {
+  override def createLocalTap(sinkMode : SinkMode) = new LocalTap(localPath, hdfsScheme, sinkMode).asInstanceOf[Tap[_, _, _]]
 }
 
 abstract class FixedPathSource(path : String*) extends FileSource {
@@ -190,12 +232,65 @@ abstract class FixedPathSource(path : String*) extends FileSource {
 * Tab separated value source
 */
 
-case class Tsv(p : String, f : Fields = Fields.ALL, sh : Boolean = false, wh: Boolean = false) extends FixedPathSource(p)
-  with DelimitedScheme {
-    override val fields = f
-    override val skipHeader = sh
-    override val writeHeader = wh
+case class Tsv(p : String, override val fields : Fields = Fields.ALL,
+  override val skipHeader : Boolean = false, override val writeHeader: Boolean = false) extends FixedPathSource(p)
+  with DelimitedScheme
+
+/** Allows you to set the types, prefer this:
+ * If T is a subclass of Product, we assume it is a tuple. If it is not, wrap T in a Tuple1:
+ * e.g. TypedTsv[Tuple1[List[Int]]]
+ */
+object TypedTsv {
+  def apply[T : Manifest : TupleConverter](paths : Seq[String]) = {
+    val f = Dsl.intFields(0 until implicitly[TupleConverter[T]].arity)
+    new TypedDelimited[T](paths, f, false, false, "\t")
+  }
+  def apply[T : Manifest : TupleConverter](path : String) = {
+    val f = Dsl.intFields(0 until implicitly[TupleConverter[T]].arity)
+    new TypedDelimited[T](Seq(path), f, false, false, "\t")
+  }
+  def apply[T : Manifest : TupleConverter](path : String, f : Fields) = {
+    new TypedDelimited[T](Seq(path), f, false, false, "\t")
+  }
 }
+
+class TypedDelimited[T](p : Seq[String], override val fields : Fields,
+  override val skipHeader : Boolean, override val writeHeader : Boolean,
+  override val separator : String)
+  (implicit mf : Manifest[T], override val converter : TupleConverter[T]) extends FixedPathSource(p : _*)
+  with DelimitedScheme with Mappable[T] {
+
+  // For Mappable:
+  override def mapTo[U](out : Fields)(fun : (T) => U)
+    (implicit flowDef : FlowDef, mode : Mode, setter : TupleSetter[U]) = {
+    RichPipe(read(flowDef, mode)).mapTo[T,U](sourceFields -> out)(fun)(converter, setter)
+  }
+  // For Mappable:
+  override def flatMapTo[U](out : Fields)(fun : (T) => Iterable[U])
+    (implicit flowDef : FlowDef, mode : Mode, setter : TupleSetter[U]) = {
+    RichPipe(read(flowDef, mode)).flatMapTo[T,U](sourceFields -> out)(fun)(converter, setter)
+  }
+
+
+  override val types : Array[Class[_]] = {
+    if (classOf[scala.Product].isAssignableFrom(mf.erasure)) {
+      //Assume this is a Tuple:
+      mf.typeArguments.map { _.erasure }.toArray
+    }
+    else {
+      //Assume there is only a single item
+      Array(mf.erasure)
+    }
+  }
+  override lazy val toString : String = "TypedDelimited" +
+    ((p,fields,skipHeader,writeHeader, separator,mf).toString)
+
+  override def equals(that : Any) : Boolean = Option(that)
+    .map { _.toString == this.toString }.getOrElse(false)
+
+  override lazy val hashCode : Int = toString.hashCode
+}
+
 /**
 * One separated value (commonly used by Pig)
 */
@@ -215,7 +310,7 @@ object TimePathedSource {
  * THIS MEANS YOU MUST END WITH A / followed by * to match a file
  * For writing, we write to the directory specified by the END time.
  */
-abstract class TimePathedSource(pattern : String, dateRange : DateRange, tz : TimeZone) extends FileSource {
+abstract class TimePathedSource(val pattern : String, val dateRange : DateRange, val tz : TimeZone) extends FileSource {
   val glober = Globifier(pattern)(tz)
   override def hdfsPaths = glober.globify(dateRange)
   //Write to the path defined by the end time:
@@ -255,6 +350,20 @@ abstract class TimePathedSource(pattern : String, dateRange : DateRange, tz : Ti
       x._2
     }
   }
+
+  override def toString =
+    "TimePathedSource(" + pattern + ", " + dateRange + ", " + tz + ")"
+
+  override def equals(that : Any) =
+    (that != null) &&
+    (this.getClass == that.getClass) &&
+    this.pattern == that.asInstanceOf[TimePathedSource].pattern &&
+    this.dateRange == that.asInstanceOf[TimePathedSource].dateRange &&
+    this.tz == that.asInstanceOf[TimePathedSource].tz
+
+  override def hashCode = pattern.hashCode +
+    31 * dateRange.hashCode +
+    (31 ^ 2) * tz.hashCode
 }
 
 /*
@@ -263,7 +372,10 @@ abstract class TimePathedSource(pattern : String, dateRange : DateRange, tz : Ti
 abstract class MostRecentGoodSource(p : String, dr : DateRange, t : TimeZone)
     extends TimePathedSource(p, dr, t) {
 
-  override protected def goodHdfsPaths(hdfsMode : Hdfs) = getPathStatuses(hdfsMode.config)
+  override def toString =
+    "MostRecentGoodSource(" + p + ", " + dr + ", " + t + ")"
+
+  override protected def goodHdfsPaths(hdfsMode : Hdfs) = getPathStatuses(hdfsMode.jobConf)
     .toList
     .reverse
     .find{ _._2 }
@@ -275,6 +387,31 @@ abstract class MostRecentGoodSource(p : String, dr : DateRange, t : TimeZone)
 
 case class TextLine(p : String) extends FixedPathSource(p) with TextLineScheme
 
-case class SequenceFile(p : String, f : Fields = Fields.ALL) extends FixedPathSource(p) with SequenceFileScheme {
+case class SequenceFile(p : String, f : Fields = Fields.ALL) extends FixedPathSource(p) with SequenceFileScheme with LocalTapSource {
   override val fields = f
+}
+
+case class MultipleSequenceFiles(p : String*) extends FixedPathSource(p:_*) with SequenceFileScheme
+
+case class MultipleTextLineFiles(p : String*) extends FixedPathSource(p:_*) with TextLineScheme
+
+case class WritableSequenceFile[K <: Writable : Manifest, V <: Writable : Manifest](p : String, f : Fields) extends FixedPathSource(p)
+  with WritableSequenceFileScheme {
+    override val fields = f
+    override val keyType = manifest[K].erasure.asInstanceOf[Class[_ <: Writable]]
+    override val valueType = manifest[V].erasure.asInstanceOf[Class[_ <: Writable]]
+  }
+
+/**
+* This Source writes out the TupleEntry as a simple JSON object, using the field names
+* as keys and the string representation of the values.
+* Only useful for writing, on read it is identical to TextLineScheme.
+*/
+case class JsonLine(p : String) extends FixedPathSource(p) with TextLineScheme {
+  import Dsl._
+
+  override def transformForWrite(pipe : Pipe) = pipe.mapTo(Fields.ALL -> 'json) {
+    t : TupleEntry =>
+    Json.generate(t.getFields.asScala.map(f => f.toString -> t.getString(f.toString)).toMap)
+  }
 }

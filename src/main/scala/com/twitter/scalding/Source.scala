@@ -26,15 +26,15 @@ import cascading.flow.hadoop.HadoopFlowProcess
 import cascading.flow.{FlowProcess, FlowDef}
 import cascading.flow.local.LocalFlowProcess
 import cascading.pipe.Pipe
-import cascading.scheme.Scheme
+import cascading.scheme.{NullScheme, Scheme}
 import cascading.scheme.local.{TextLine => CLTextLine, TextDelimited => CLTextDelimited}
 import cascading.scheme.hadoop.{TextLine => CHTextLine, TextDelimited => CHTextDelimited, SequenceFile => CHSequenceFile}
 import cascading.tap.hadoop.Hfs
 import cascading.tap.MultiSourceTap
 import cascading.tap.SinkMode
-import cascading.tap.Tap
+import cascading.tap.{Tap, SinkTap}
 import cascading.tap.local.FileTap
-import cascading.tuple.{Tuple, Fields}
+import cascading.tuple.{Tuple, Fields, TupleEntry, TupleEntryCollector}
 
 import org.apache.hadoop.conf.Configuration
 import org.apache.hadoop.fs.Path
@@ -60,6 +60,15 @@ sealed abstract class AccessMode
 case object Read extends AccessMode
 case object Write extends AccessMode
 
+// Scala is pickier than Java about type parameters, and Cascading's Scheme
+// declaration leaves some type parameters underspecified.  Fill in the type
+// parameters with wildcards so the Scala compiler doesn't complain.
+
+object HadoopSchemeInstance {
+  def apply(scheme: Scheme[_, _, _, _, _]) =
+    scheme.asInstanceOf[Scheme[JobConf, RecordReader[_, _], OutputCollector[_, _], _, _]]
+}
+
 /**
 * Every source must have a correct toString method.  If you use
 * case classes for instances of sources, you will get this for free.
@@ -73,10 +82,10 @@ abstract class Source extends java.io.Serializable {
   type LocalScheme = Scheme[Properties, InputStream, OutputStream, _, _]
 
   def localScheme : LocalScheme = {
-    error("Cascading local mode not supported for: " + toString)
+    sys.error("Cascading local mode not supported for: " + toString)
   }
   def hdfsScheme : Scheme[JobConf,RecordReader[_,_],OutputCollector[_,_],_,_] = {
-    error("Cascading Hadoop mode not supported for: " + toString)
+    sys.error("Cascading Hadoop mode not supported for: " + toString)
   }
 
   def read(implicit flowDef : FlowDef, mode : Mode) = {
@@ -93,7 +102,7 @@ abstract class Source extends java.io.Serializable {
   * write the pipe and return the input so it can be chained into
   * the next operation
   */
-  def write(pipe : Pipe)(implicit flowDef : FlowDef, mode : Mode) = {
+  def writeFrom(pipe : Pipe)(implicit flowDef : FlowDef, mode : Mode) = {
     //insane workaround for scala compiler bug
     val sinks = flowDef.getSinks().asInstanceOf[JMap[String,Any]]
     val sinkName = this.toString
@@ -173,21 +182,66 @@ abstract class Source extends java.io.Serializable {
 */
 trait Mappable[T] extends Source {
   // These are the default column number YOU MAY NEED TO OVERRIDE!
-  val columnNums = Seq(0)
-  def sourceFields : Fields = Dsl.intFields(columnNums)
-
+  def sourceFields : Fields = Dsl.intFields(0 until converter.arity)
+  // Due to type erasure, your subclass must supply this
+  val converter : TupleConverter[T]
   def mapTo[U](out : Fields)(mf : (T) => U)
-    (implicit flowDef : FlowDef, mode : Mode,
-     conv : TupleConverter[T], setter : TupleSetter[U]) = {
-    RichPipe(read(flowDef, mode)).mapTo[T,U](sourceFields -> out)(mf)(conv, setter)
+    (implicit flowDef : FlowDef, mode : Mode, setter : TupleSetter[U]) = {
+    RichPipe(read(flowDef, mode)).mapTo[T,U](sourceFields -> out)(mf)(converter, setter)
   }
   /**
   * If you want to filter, you should use this and output a 0 or 1 length Iterable.
   * Filter does not change column names, and we generally expect to change columns here
   */
   def flatMapTo[U](out : Fields)(mf : (T) => Iterable[U])
-    (implicit flowDef : FlowDef, mode : Mode,
-     conv : TupleConverter[T], setter : TupleSetter[U]) = {
-    RichPipe(read(flowDef, mode)).flatMapTo[T,U](sourceFields -> out)(mf)(conv, setter)
+    (implicit flowDef : FlowDef, mode : Mode, setter : TupleSetter[U]) = {
+    RichPipe(read(flowDef, mode)).flatMapTo[T,U](sourceFields -> out)(mf)(converter, setter)
+  }
+}
+
+
+/**
+ * A tap that output nothing. It is used to drive execution of a task for side effect only. This
+ * can be used to drive a pipe without actually writing to HDFS.
+ * */
+class NullTap[Config, Input, Output, SourceContext, SinkContext]
+  extends SinkTap[Config, Output] (
+    new NullScheme[Config, Input, Output, SourceContext, SinkContext](Fields.NONE, Fields.ALL),
+      SinkMode.UPDATE) {
+
+  def getIdentifier = "nullTap"
+  def openForWrite(flowProcess: FlowProcess[Config], output: Output) =
+    new TupleEntryCollector {
+      override def add(te: TupleEntry) {}
+      override def add(t: Tuple) {}
+      protected def collect(te: TupleEntry) {}
+    }
+
+  def createResource(conf: Config) = true
+  def deleteResource(conf: Config) = false
+  def resourceExists(conf: Config) = true
+  def getModifiedTime(conf: Config) = 0
+}
+
+/**
+ * A source outputs nothing. It is used to drive execution of a task for side effect only.
+ */
+object NullSource extends Source {
+  override def localScheme =
+    new NullScheme[Properties, InputStream, OutputStream, Any, Any]
+      (Fields.NONE, Fields.ALL)
+  override def hdfsScheme =
+    new NullScheme[JobConf, RecordReader[_,_], OutputCollector[_,_], Any, Any]
+      (Fields.NONE, Fields.ALL)
+
+  override def createTap(readOrWrite : AccessMode)(implicit mode : Mode) : Tap[_,_,_] = {
+    readOrWrite match {
+      case Read => throw new Exception("not supported, reading from null")
+      case Write => mode match {
+        case Hdfs(_, _) => new NullTap[JobConf, RecordReader[_,_], OutputCollector[_,_], Any, Any]
+        case Local(_) => new NullTap[Properties, InputStream, OutputStream, Any, Any]
+        case Test(_) => new NullTap[Properties, InputStream, OutputStream, Any, Any]
+      }
+    }
   }
 }

@@ -8,6 +8,10 @@ import java.io.{ByteArrayOutputStream=>BOS}
 import java.io.{ByteArrayInputStream=>BIS}
 
 import scala.collection.immutable.ListMap
+import scala.collection.immutable.HashMap
+
+import com.twitter.algebird.{AveragedValue, DecayedValue, HLLInstance,
+  HyperLogLog, HyperLogLogMonoid, Moments, Monoid}
 
 /*
 * This is just a test case for Kryo to deal with. It should
@@ -17,6 +21,7 @@ import scala.collection.immutable.ListMap
 case class TestCaseClassForSerialization(x : String, y : Int)
 
 case class TestValMap(val map : Map[String,Double])
+case class TestValHashMap(val map : HashMap[String,Double])
 
 class KryoTest extends Specification {
 
@@ -60,20 +65,36 @@ class KryoTest extends Specification {
 
   "KryoSerializers and KryoDeserializers" should {
     "round trip any non-array object" in {
+      import HyperLogLog._
+      implicit val hllmon = new HyperLogLogMonoid(4)
       val test = List(1,2,"hey",(1,2),Args("--this is --a --b --test 34"),
-                      ("hey","you"),Map(1->2,4->5),0 to 100,
+                      ("hey","you"),
+                      ("slightly", 1L, "longer", 42, "tuple"),
+                      Map(1->2,4->5),
+                      0 to 100,
                       (0 to 42).toList, Seq(1,100,1000),
                       Map("good" -> 0.5, "bad" -> -1.0),
                       Set(1,2,3,4,10),
                       ListMap("good" -> 0.5, "bad" -> -1.0),
+                      HashMap("good" -> 0.5, "bad" -> -1.0),
                       TestCaseClassForSerialization("case classes are: ", 10),
                       TestValMap(Map("you" -> 1.0, "every" -> 2.0, "body" -> 3.0, "a" -> 1.0,
                         "b" -> 2.0, "c" -> 3.0, "d" -> 4.0)),
+                      TestValHashMap(HashMap("you" -> 1.0)),
                       Vector(1,2,3,4,5),
                       TestValMap(null),
-                      Some("junk"))
+                      Some("junk"),
+                      DecayedValue(1.0, 2.0),
+                      Moments(100.0), Monoid.plus(Moments(100), Moments(2)),
+                      AveragedValue(100, 32.0),
+                      // Serialize an instance of the HLL monoid
+                      hllmon.apply(42),
+                      Monoid.sum(List(1,2,3,4).map { hllmon(_) }),
+                      'hai)
         .asInstanceOf[List[AnyRef]]
       serializationRT(test) must be_==(test)
+      // HyperLogLogMonoid doesn't have a good equals. :(
+      singleRT(new HyperLogLogMonoid(5)).bits must be_==(5)
     }
     "handle arrays" in {
       def arrayRT[T](arr : Array[T]) {

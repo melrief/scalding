@@ -1,5 +1,38 @@
 # Scalding #
 
+### Version 0.8.1 ###
+* ISSUE 220: Etsy date improvements and local-mode tap improvements
+* ISSUE 219: scald.rb fix
+* ISSUE 218: Add aggregate method to ReduceOperations
+* ISSUE 216: Improve variance notations
+* ISSUE 213,215: Make Field[T] serializable
+* ISSUE 210,211: Refactor date code into individual files + tests
+* ISSUE 209: Add hourly/daily time pathed source classes
+* ISSUE 207,208: sbt build improvements
+* ISSUE 205,206: Remove scala serialization code to com.twitter.chill
+* ISSUE 203: Improved date-parsing and docs (from Etsy)
+* ISSUE 202,204: Add propagate/mapWithIndex in Matrix (use Monoids with graphs)
+* ISSUE 201: add stdDev to groupBuilder.
+* ISSUE 200: typed write and key-value swap
+* ISSUE 196: Clean up deprecations
+* ISSUE 194,195: Fix negative numbers as args
+* ISSUE 190-192,197,199: Improved Joining/Co-grouping in the typed-API
+
+### Version 0.8.0 ###
+* Many small bugfixes
+* ISSUE 189: Adds spillThreshold to GroupBuilder to tune memory usage
+* ISSUE 187: Adds TypedTsv for type-safe TSV files.
+* ISSUE 179: Add forceToDisk to help hand optimization of flows
+* ISSUE 175: API to set the type/comparators in the Fields API.
+* ISSUE 162, 163: Adds keys, values methods to Typed-API
+* ISSUE 160: adds approxUniques to GroupBuilder
+* ISSUE 153: mapPlusMap in GroupBuilder
+* ISSUE 149: Support for Hadoop sequence files
+* ISSUE 148: Matrix API
+* ISSUE 147: Move Monoid/Algebra code to Algebird
+* Mulitple issues: many new Kryo serializers added
+* ISSUE 140: Adds ability to do side-effects (foreach, using in RichPipe)
+
 ### Version 0.7.3 ###
 * ISSUE 134: Cleans up scalding.Tool
 * ISSUE 133: Adds SortedListTake monoid, Either monoid, and tests

@@ -7,10 +7,9 @@ require 'thread'
 require 'trollop'
 require 'yaml'
 
-SCALDING_VERSION="0.7.3"
-
 USAGE = <<END
-Usage : scald.rb [--jar jarfile] [--hdfs|--hdfs-local|--local|--print] job <job args>
+Usage : scald.rb [--cp classpath] [--jar jarfile] [--hdfs|--hdfs-local|--local|--print] job <job args>
+ --cp: scala classpath
  --clean: clean rsync and maven state before running
  --jar ads-batch: specify the jar file
  --hdfs: if job ends in ".scala" or ".java" and the file exists, link it against JARFILE (below) and then run it on HOST.
@@ -29,7 +28,7 @@ CONFIG_DEFAULT = begin
   repo_root = File.expand_path(File.dirname(original_file)+"/../")
   { "host" => "my.host.here", #where the job is rsynced to and run
     "repo_root" => repo_root, #full path to the repo you use, Twitter specific
-    "jar" => repo_root + "/target/scalding-assembly-#{SCALDING_VERSION}.jar", #what jar has all the depencies for this job
+    "cp" => ENV['CLASSPATH'] || "",
     "localmem" => "3g", #how much memory for java to use when running in local mode
     "namespaces" => { "abj" => "com.twitter.ads.batch.job", "s" => "com.twitter.scalding" },
     "hadoop_opts" => { "mapred.reduce.tasks" => 20, #be conservative by default
@@ -46,17 +45,34 @@ end
 
 CONFIG_RC = begin
 #put configuration in .scaldrc in HOME to override the defaults below:
-    YAML.load_file(ENV['HOME'] + "/.scaldrc")
+    YAML.load_file(ENV['HOME'] + "/.scaldrc") || {} #seems that on ruby 1.9, this returns false on failure
   rescue
     {}
   end
 
 CONFIG = CONFIG_DEFAULT.merge!(CONFIG_RC)
 
-#optionally set variables:
-TMPDIR=CONFIG["tmpdir"] || ENV['TMPDIR']
+BUILDFILE = open(CONFIG["repo_root"] + "/build.sbt").read
+SCALDING_VERSION=BUILDFILE.match(/version\s*:=\s*\"([^\"]+)\"/)[1]
+SCALA_VERSION=BUILDFILE.match(/scalaVersion\s*:=\s*\"([^\"]+)\"/)[1]
+
+if (!CONFIG["jar"])
+  #what jar has all the depencies for this job
+  CONFIG["jar"] = repo_root + "/target/scalding-assembly-#{SCALDING_VERSION}.jar"
+end
+
+#Check that we can find the jar:
+if (!File.exist?(CONFIG["jar"]))
+  puts("#{CONFIG["jar"]} is missing, you probably need to run sbt assembly")
+  exit(1)
+end
+
+#optionally set variables (not linux often doesn't have this set, and falls back to TMP. Set up a
+#YAML file in .scaldrc with "tmpdir: my_tmp_directory_name" or export TMPDIR="/my/tmp" to set on
+#linux
+TMPDIR=CONFIG["tmpdir"] || ENV['TMPDIR'] || "/tmp"
 TMPMAVENDIR = File.join(TMPDIR, "maven")
-BUILDDIR=CONFIG["builddir"] || (ENV['TMPDIR'] + "script-build")
+BUILDDIR=CONFIG["builddir"] || File.join(TMPDIR,"script-build")
 LOCALMEM=CONFIG["localmem"] || "3g"
 DEPENDENCIES=CONFIG["depends"] || []
 RSYNC_STATFILE_PREFIX = TMPDIR + "/scald.touch."
@@ -65,6 +81,7 @@ RSYNC_STATFILE_PREFIX = TMPDIR + "/scald.touch."
 #This parser holds the {job <job args>} part of the command.
 OPTS_PARSER = Trollop::Parser.new do
   opt :clean, "Clean all rsync and maven state before running"
+  opt :cp, "Scala classpath", :type => String
   opt :hdfs, "Run on HDFS"
   opt :hdfs_local, "Run in Hadoop local mode"
   opt :local, "Run in Cascading local mode (does not use Hadoop)"
@@ -115,9 +132,17 @@ if ARGV.size < 1
 end
 
 SBT_HOME="#{ENV['HOME']}/.sbt"
-COMPILE_CMD="java -cp #{SBT_HOME}/boot/scala-2.8.1/lib/scala-library.jar:#{SBT_HOME}/boot/scala-2.8.1/lib/scala-compiler.jar -Dscala.home=#{SBT_HOME}/boot/scala-2.8.1/lib/ scala.tools.nsc.Main"
+SCALA_LIB="#{SBT_HOME}/boot/scala-#{SCALA_VERSION}/lib/scala-library.jar"
+COMPILE_CMD="java -cp #{SCALA_LIB}:#{SBT_HOME}/boot/scala-#{SCALA_VERSION}/lib/scala-compiler.jar -Dscala.home=#{SBT_HOME}/boot/scala-#{SCALA_VERSION}/lib/ scala.tools.nsc.Main"
 
 HOST = OPTS[:host] || CONFIG["host"]
+
+CLASSPATH =
+  if OPTS[:cp]
+    CONFIG["cp"] + ":" + OPTS[:cp]
+  else
+    CONFIG["cp"]
+  end
 
 JARFILE =
   if OPTS[:jar]
@@ -304,10 +329,10 @@ THREADS = ThreadList.new
 def human_filesize(filename)
   size = File.size(filename)
   case
-  when size < 2**10: '%d bytes' % size
-  when size < 2**20: '%.1fK'    % (1.0 * size / 2**10)
-  when size < 2**30: '%.1fM'    % (1.0 * size / 2**20)
-  else               '%.1fG'    % (1.0 * size / 2**30)
+  when size < 2**10 then '%d bytes' % size
+  when size < 2**20 then '%.1fK'    % (1.0 * size / 2**10)
+  when size < 2**30 then '%.1fM'    % (1.0 * size / 2**20)
+  else                   '%.1fG'    % (1.0 * size / 2**30)
   end
 end
 
@@ -337,7 +362,6 @@ end
 def is_local?
   OPTS[:local] || OPTS[:hdfs_local]
 end
-
 def needs_rebuild?
   if !File.exists?(JOBJARPATH)
     true
@@ -354,9 +378,10 @@ end
 def build_job_jar
   $stderr.puts("compiling " + JOBFILE)
   FileUtils.mkdir_p(BUILDDIR)
-  classpath = (convert_dependencies_to_jars + [JARPATH]).join(":")
+  classpath = (convert_dependencies_to_jars +
+               ([SCALA_LIB, JARPATH, CLASSPATH].select { |s| s != "" })).join(":")
   puts("#{file_type}c -classpath #{classpath} -d #{BUILDDIR} #{JOBFILE}")
-  unless system("#{COMPILE_CMD} -classpath #{JARPATH} -d #{BUILDDIR} #{JOBFILE}")
+  unless system("#{COMPILE_CMD} -classpath #{classpath} -d #{BUILDDIR} #{JOBFILE}")
     FileUtils.rm_f(rsync_stat_file(JOBJARPATH))
     FileUtils.rm_rf(BUILDDIR)
     exit(1)
@@ -394,7 +419,8 @@ if is_file?
 end
 
 def local_cmd(mode)
-  classpath = (convert_dependencies_to_jars + [JARPATH]).join(":") + (is_file? ? ":#{JOBJARPATH}" : "")
+  classpath = (convert_dependencies_to_jars + [JARPATH]).join(":") + (is_file? ? ":#{JOBJARPATH}" : "") +
+                ":" + CLASSPATH
   "java -Xmx#{LOCALMEM} -cp #{classpath} com.twitter.scalding.Tool #{JOB} #{mode} " + JOB_ARGS
 end
 

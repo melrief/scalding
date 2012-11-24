@@ -32,10 +32,13 @@ import cascading.tuple.hadoop.io.BufferedInputStream
 
 import scala.annotation.tailrec
 import scala.collection.immutable.ListMap
+import scala.collection.immutable.HashMap
 
 import com.twitter.scalding.DateRange
 import com.twitter.scalding.RichDate
 import com.twitter.scalding.Args
+
+import com.twitter.chill._
 
 import org.objenesis.strategy.StdInstantiatorStrategy;
 
@@ -74,19 +77,19 @@ class KryoHadoop extends KryoSerialization {
   }
 
   override def decorateKryo(newK : Kryo) {
-
-    newK.addDefaultSerializer(classOf[List[Any]],
-      new ListSerializer[AnyRef,List[AnyRef]](List[AnyRef]()))
-    newK.addDefaultSerializer(classOf[Vector[Any]], new VectorSerializer[Any])
-    newK.addDefaultSerializer(classOf[Set[Any]], new SetSerializer[Any,Set[Any]](Set[Any]()))
+    // These are scalding objects:
     newK.register(classOf[RichDate], new RichDateSerializer())
     newK.register(classOf[DateRange], new DateRangeSerializer())
     newK.register(classOf[Args], new ArgsSerializer)
-    // Add some maps
-    newK.addDefaultSerializer(classOf[ListMap[Any,Any]],
-      new MapSerializer[Any,Any,ListMap[Any,Any]](ListMap[Any,Any]()))
-    newK.addDefaultSerializer(classOf[Map[Any,Any]],
-      new MapSerializer[Any,Any,Map[Any,Any]](Map[Any,Any]()))
+    // Some of the monoids from Algebird that we use:
+    newK.register(classOf[com.twitter.algebird.AveragedValue], new AveragedValueSerializer)
+    newK.register(classOf[com.twitter.algebird.DecayedValue], new DecayedValueSerializer)
+    newK.register(classOf[com.twitter.algebird.HyperLogLogMonoid], new HLLMonoidSerializer)
+    newK.register(classOf[com.twitter.algebird.Moments], new MomentsSerializer)
+    newK.addDefaultSerializer(classOf[com.twitter.algebird.HLL], new HLLSerializer)
+
+    // Register all the chill serializers:
+    KryoSerializer.registerAll(newK)
 
     //Add commonly used types with Fields serializer:
     registeredTypes.foreach { cls => newK.register(cls) }
@@ -112,14 +115,8 @@ class KryoHadoop extends KryoSerialization {
       // Arrays
       Array(1), Array(1.0), Array(1.0f), Array(1L), Array(""), Array(("", "")),
       Array(new java.lang.Object), Array(1.toByte), Array(true), Array('c'),
-      // Specialized Tuple2s: (Int,Long,Double) are defined for 1,2
-      Tuple1(""), Tuple1(1), Tuple1(1L), Tuple1(1.0),
-      ("", ""), (1, 1), (1.0, 1.0), (1L, 1L),
-      (1, 1.0), (1.0, 1), (1L, 1.0), (1.0, 1L), (1, 1L), (1L, 1),
       // Options and Either
-      Some(1), Left(1), Right(1),
-      // Higher-dimensional tuples, not specialized
-      (1, 1, 1), (1, 1, 1, 1), (1, 1, 1, 1, 1)
+      Some(1), Left(1), Right(1)
     ).map { _.getClass }
   }
 }

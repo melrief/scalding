@@ -72,6 +72,61 @@ import CascadingUtils.kryoFor
     }
   }
 
+  /*
+   * A map function that allows state object to be set up and tear down.
+   */
+  class SideEffectMapFunction[S, C, T] (
+    bf: => C,                // begin function returns a context
+    fn: (C, S) => T,         // function that takes a context and a tuple and generate a new tuple
+    ef: C => Unit,           // end function to clean up context object
+    fields: Fields,
+    conv: TupleConverter[S],
+    set: TupleSetter[T]
+  ) extends BaseOperation[C](fields) with Function[C] {
+
+    override def prepare(flowProcess: FlowProcess[_], operationCall: OperationCall[C]) {
+      operationCall.setContext(bf)
+    }
+
+    override def operate(flowProcess: FlowProcess[_], functionCall: FunctionCall[C]) {
+      val context = functionCall.getContext
+      val s = conv(functionCall.getArguments)
+      val res = fn(context, s)
+      functionCall.getOutputCollector.add(set(res))
+    }
+
+    override def cleanup(flowProcess: FlowProcess[_], operationCall: OperationCall[C]) {
+      ef(operationCall.getContext)
+    }
+  }
+
+  /*
+   * A flatmap function that allows state object to be set up and tear down.
+   */
+  class SideEffectFlatMapFunction[S, C, T] (
+    bf: => C,                  // begin function returns a context
+    fn: (C, S) => Iterable[T], // function that takes a context and a tuple, returns iterable of T
+    ef: C => Unit,             // end function to clean up context object
+    fields: Fields,
+    conv: TupleConverter[S],
+    set: TupleSetter[T]
+  ) extends BaseOperation[C](fields) with Function[C] {
+
+    override def prepare(flowProcess: FlowProcess[_], operationCall: OperationCall[C]) {
+      operationCall.setContext(bf)
+    }
+
+    override def operate(flowProcess: FlowProcess[_], functionCall: FunctionCall[C]) {
+      val context = functionCall.getContext
+      val s = conv(functionCall.getArguments)
+      fn(context, s) foreach { t => functionCall.getOutputCollector.add(set(t)) }
+    }
+
+    override def cleanup(flowProcess: FlowProcess[_], operationCall: OperationCall[C]) {
+      ef(operationCall.getContext)
+    }
+  }
+
   class FilterFunction[T](fn : T => Boolean, conv : TupleConverter[T]) extends BaseOperation[Any] with Filter[Any] {
     def isRemove(flowProcess : FlowProcess[_], filterCall : FilterCall[Any]) = {
       !fn(conv(filterCall.getArguments))
@@ -139,6 +194,8 @@ import CascadingUtils.kryoFor
       val ctx = call.getContext
       if (null != ctx) {
         val lastValue = ctx.getObject(0).asInstanceOf[X]
+        // Make sure to drop the reference to the lastValue as soon as possible (it may be big)
+        call.setContext(null)
         call.getOutputCollector.add(set(mrfn(lastValue)))
       }
       else {
@@ -189,7 +246,10 @@ import CascadingUtils.kryoFor
         throw new Exception("FoldFunctor completed with any aggregate calls")
       }
       else {
-        finish(context.getObject(0).asInstanceOf[X])
+        val res = context.getObject(0).asInstanceOf[X]
+        // Make sure we remove the ref to the context ASAP:
+        context.set(0, null)
+        finish(res)
       }
     }
   }
@@ -239,56 +299,4 @@ import CascadingUtils.kryoFor
       iterfn(deepCopyInit, in).foreach { x => oc.add(set(x)) }
     }
   }
-  /*
-   * fields are the declared fields of this aggregator
-   */
-  class ExtremumAggregator(choose_max : Boolean, fields : Fields)
-    extends BaseOperation[Tuple](fields) with Aggregator[Tuple] {
-
-    def start(flowProcess : FlowProcess[_], call : AggregatorCall[Tuple]) {
-        call.setContext(null)
-    }
-    private def getArgs(call : AggregatorCall[Tuple]) = call.getArguments.getTuple
-
-    def aggregate(flowProcess : FlowProcess[_], call : AggregatorCall[Tuple]) = {
-      val arg = getArgs(call)
-      val ctx = call.getContext
-      if (null == ctx) {
-        call.setContext(arg)
-      }
-      else {
-        val (max, min) = if( ctx.compareTo(arg) < 0 ) {
-          (arg, ctx)
-        } else { (ctx, arg) }
-        call.setContext(if(choose_max) max else min)
-      }
-    }
-    def complete(flowProcess : FlowProcess[_], call : AggregatorCall[Tuple]) {
-      val ctx = call.getContext
-      if (null != ctx) {
-        call.getOutputCollector.add(ctx)
-      }
-      else {
-        throw new Exception("ExtremumAggregator called only once")
-      }
-    }
-  }
-  class ExtremumFunctor(choose_max : Boolean, fields : Fields) extends AggregateBy.Functor {
-    override def getDeclaredFields = fields
-    def aggregate(flowProcess : FlowProcess[_], args : TupleEntry, context : Tuple) = {
-      val this_tup = args.getTuple
-      if(context == null) { this_tup }
-      else {
-        val (max, min) = if( context.compareTo(this_tup) < 0 ) {
-          (this_tup, context)
-        } else { (context, this_tup) }
-        if(choose_max) max else min
-      }
-    }
-    def complete(flowProcess : FlowProcess[_], context : Tuple) = context
-  }
-  class ExtremumBy(choosemax : Boolean, arguments : Fields, result : Fields) extends AggregateBy (
-        arguments,
-        new ExtremumFunctor(choosemax, result),
-        new ExtremumAggregator(choosemax, result))
 }
